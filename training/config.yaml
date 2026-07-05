@@ -1,0 +1,42 @@
+# training/config.yaml
+# Hyperparameters and paths for the Multimodal Sparse MoE training pipeline.
+# Designed for Google Colab (T4/L4/A100).
+
+model:
+  phi_model_name:         "microsoft/Phi-mini-MoE-instruct"
+  num_moe_experts:        8
+  top_k:                  2
+  capacity_factor:        1.25
+  aux_loss_weight:        0.01
+  replace_every_n_layers: 2       # replace every Nth backbone FFN with SparseMoE
+  freeze_encoders:        true    # keep Whisper & CLIP frozen to save VRAM
+
+data:
+  text_dataset:         "allenai/c4"
+  text_subset:          5000      # number of C4 examples to stream
+  image_dataset:        "HuggingFaceM4/COCO"
+  image_subset:         500
+  audio_dataset:        "openslr/librispeech_asr"
+  audio_subset:         500
+  max_text_length:      256       # max tokens per text sample
+  max_audio_duration_sec: 30      # Whisper's 30-second window
+
+training:
+  seed:                       42
+  num_epochs:                 3
+  batch_size:                 4
+  gradient_accumulation_steps: 8  # effective batch = 4 * 8 = 32
+  learning_rate:              2.0e-5
+  weight_decay:               0.01
+  warmup_steps:               100
+  lr_scheduler:               "cosine"
+  mixed_precision:            "bf16"  # "fp16" on T4; "bf16" on A100/L4
+  max_grad_norm:              1.0
+  log_every_steps:            10
+  eval_every_epochs:          1
+  save_every_epochs:          1
+
+paths:
+  checkpoint_dir: "checkpoints"
+  log_dir:        "logs"
+  output_dir:     "output"
