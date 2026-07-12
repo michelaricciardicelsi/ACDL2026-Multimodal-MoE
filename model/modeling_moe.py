@@ -162,8 +162,9 @@ class SparseMoELayer(nn.Module):
             # Retrieve this expert's gate weight for each selected token
             # topk_indices[token_indices]: (k, top_k)
             # We find the position in top_k where the expert_idx is
-            match         = (topk_indices[token_indices] == expert_idx).float()  # (k, top_k)
-            gate_w        = (topk_weights[token_indices] * match).sum(dim=-1, keepdim=True)  # (k, 1)
+            match         = (topk_indices[token_indices] == expert_idx).to(topk_weights.dtype)  # (k, top_k)
+            gate_w        = (topk_weights[token_indices] * match).sum(dim=-1, keepdim=True)
+            gate_w        = gate_w.to(expert_output.dtype)  # (k, 1)
 
             output_flat.index_add_(0, token_indices, gate_w * expert_output)
 

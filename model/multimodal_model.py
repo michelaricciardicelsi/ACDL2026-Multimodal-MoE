@@ -277,6 +277,31 @@ class MultimodalMoEModel(nn.Module):
         # ---- Text embedding (reuse Phi's embedding table, no copy) ----
         self._embed_tokens = self.backbone.get_input_embeddings()
 
+    def _apply_demo_moe(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply the custom SparseMoE stack to fused embeddings before the backbone.
+
+        This keeps the demo path simple and observable on Colab without replacing
+        Phi's internal FFN modules.
+        """
+        total_aux_loss = hidden_states.new_zeros(())
+        if not self.moe_layers:
+            return hidden_states, total_aux_loss
+
+        moe_hidden = hidden_states
+        for layer_idx in sorted(self.moe_layers.keys(), key=int):
+            layer = self.moe_layers[layer_idx]
+            if any(param.device != moe_hidden.device or param.dtype != moe_hidden.dtype
+                   for param in layer.parameters()):
+                layer = layer.to(device=moe_hidden.device, dtype=moe_hidden.dtype)
+                self.moe_layers[layer_idx] = layer
+            moe_hidden, aux_loss = layer(moe_hidden)
+            total_aux_loss = total_aux_loss + aux_loss
+
+        return moe_hidden, total_aux_loss
+
     # ------------------------------------------------------------------
     # Properties / helpers
     # ------------------------------------------------------------------
@@ -317,27 +342,31 @@ class MultimodalMoEModel(nn.Module):
         Returns:
             dict with keys: 'loss', 'aux_loss', 'total_loss', 'logits'
         """
-        device = input_ids.device if input_ids is not None else next(self.parameters()).device
-
-        total_aux_loss = torch.tensor(0.0, device=device)
+        embed_device = self._embed_tokens.weight.device
+        device = embed_device
 
         # 1. Text embeddings via Phi embedding table
-        text_embeds = self._embed_tokens(input_ids)          # (B, T_text, H)
+        text_embeds = self._embed_tokens(input_ids.to(embed_device))  # (B, T_text, H)
 
         # 2. Optional vision embeddings
         image_embeds = None
         if pixel_values is not None:
-            image_embeds = self.vision_encoder(pixel_values) # (B, T_img, H)
+            vision_device = next(self.vision_encoder.parameters()).device
+            image_embeds = self.vision_encoder(pixel_values.to(vision_device)).to(embed_device)
 
         # 3. Optional audio embeddings
         audio_embeds = None
         if input_features is not None:
-            audio_embeds = self.audio_encoder(input_features) # (B, T_audio, H)
+            audio_device = next(self.audio_encoder.parameters()).device
+            audio_embeds = self.audio_encoder(input_features.to(audio_device)).to(embed_device)
 
         # 4. Fuse all modalities
         fused_embeds, fused_mask = self.fusion(text_embeds, image_embeds, audio_embeds)
 
-        # 5. Phi backbone forward (via inputs_embeds — skip token embedding layer)
+        # 5. Demo-safe custom MoE path on fused embeddings
+        fused_embeds, total_aux_loss = self._apply_demo_moe(fused_embeds)
+
+        # 6. Phi backbone forward (via inputs_embeds — skip token embedding layer)
         backbone_out = self.backbone(
             inputs_embeds=fused_embeds,
             attention_mask=fused_mask,
@@ -347,9 +376,10 @@ class MultimodalMoEModel(nn.Module):
         )
         logits = backbone_out.logits  # (B, T_fused, vocab_size)
 
-        # 6. Causal LM loss restricted to the text prefix tokens
+        # 7. Causal LM loss restricted to the text prefix tokens
         task_loss = torch.tensor(0.0, device=device)
         if labels is not None:
+            labels       = labels.to(logits.device)
             T_text       = input_ids.shape[1]
             text_logits  = logits[:, :T_text, :].contiguous()
             shift_logits = text_logits[:, :-1, :].contiguous()
